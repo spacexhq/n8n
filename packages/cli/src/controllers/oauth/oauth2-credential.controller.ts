@@ -5,7 +5,12 @@ import { Response } from 'express';
 import omit from 'lodash/omit';
 import set from 'lodash/set';
 import split from 'lodash/split';
-import { type ICredentialDataDecryptedObject, jsonStringify } from 'n8n-workflow';
+import {
+	ensureError,
+	type ICredentialDataDecryptedObject,
+	jsonParse,
+	jsonStringify,
+} from 'n8n-workflow';
 import pkceChallenge from 'pkce-challenge';
 import * as qs from 'querystring';
 
@@ -111,6 +116,7 @@ export class OAuth2CredentialController extends AbstractOAuthController {
 			} else if (oauthCredentials.authentication === 'body') {
 				options = {
 					body: {
+						...(oAuthOptions.body ?? {}),
 						client_id: oAuthOptions.clientId,
 						client_secret: oAuthOptions.clientSecret,
 					},
@@ -148,18 +154,18 @@ export class OAuth2CredentialController extends AbstractOAuthController {
 			});
 
 			return res.render('oauth-callback');
-		} catch (error) {
+		} catch (e) {
+			const error = ensureError(e);
 			return this.renderCallbackError(
 				res,
-				(error as Error).message,
-				// eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+				error.message,
 				'body' in error ? jsonStringify(error.body) : undefined,
 			);
 		}
 	}
 
 	private convertCredentialToOptions(credential: OAuth2CredentialData): ClientOAuth2Options {
-		return {
+		const options: ClientOAuth2Options = {
 			clientId: credential.clientId,
 			clientSecret: credential.clientSecret ?? '',
 			accessTokenUri: credential.accessTokenUrl ?? '',
@@ -170,5 +176,18 @@ export class OAuth2CredentialController extends AbstractOAuthController {
 			scopesSeparator: credential.scope?.includes(',') ? ',' : ' ',
 			ignoreSSLIssues: credential.ignoreSSLIssues ?? false,
 		};
+
+		if (
+			credential.additionalBodyProperties &&
+			typeof credential.additionalBodyProperties === 'string'
+		) {
+			const parsedBody = jsonParse<Record<string, string>>(credential.additionalBodyProperties);
+
+			if (parsedBody) {
+				options.body = parsedBody;
+			}
+		}
+
+		return options;
 	}
 }

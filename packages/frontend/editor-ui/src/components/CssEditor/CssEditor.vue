@@ -10,18 +10,18 @@ import {
 	keymap,
 	lineNumbers,
 } from '@codemirror/view';
-import { computed, onMounted, ref, toRaw, watch } from 'vue';
+import { computed, ref, toRaw } from 'vue';
 
 import { useExpressionEditor } from '@/composables/useExpressionEditor';
 import { n8nCompletionSources } from '@/plugins/codemirror/completions/addCompletions';
-import { editorKeymap } from '@/plugins/codemirror/keymap';
-import { n8nAutocompletion } from '@/plugins/codemirror/n8nLang';
-import { codeEditorTheme } from '../CodeNodeEditor/theme';
 import { dropInExpressionEditor, mappingDropCursor } from '@/plugins/codemirror/dragAndDrop';
 import {
 	expressionCloseBrackets,
 	expressionCloseBracketsConfig,
 } from '@/plugins/codemirror/expressionCloseBrackets';
+import { editorKeymap } from '@/plugins/codemirror/keymap';
+import { n8nAutocompletion } from '@/plugins/codemirror/n8nLang';
+import { codeEditorTheme } from '../CodeNodeEditor/theme';
 
 type Props = {
 	modelValue: string;
@@ -71,21 +71,15 @@ const extensions = computed(() => [
 
 const {
 	editor: editorRef,
-	segments,
 	readEditorValue,
-	isDirty,
+	focus,
 } = useExpressionEditor({
 	editorRef: cssEditor,
 	editorValue,
 	extensions,
-});
-
-watch(segments.display, () => {
-	emit('update:model-value', readEditorValue());
-});
-
-onMounted(() => {
-	if (isDirty.value) emit('update:model-value', readEditorValue());
+	onChange: () => {
+		emit('update:model-value', readEditorValue());
+	},
 });
 
 async function onDrop(value: string, event: MouseEvent) {
@@ -93,6 +87,10 @@ async function onDrop(value: string, event: MouseEvent) {
 
 	await dropInExpressionEditor(toRaw(editorRef.value), event, value);
 }
+
+defineExpose({
+	focus,
+});
 </script>
 
 <template>

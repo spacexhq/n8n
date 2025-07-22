@@ -25,7 +25,6 @@ import {
 import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, toRef, watch } from 'vue';
 
 import type {
-	IExecutionResponse,
 	INodeUi,
 	INodeUpdatePropertiesInformation,
 	IRunDataDisplayMode,
@@ -42,8 +41,9 @@ import {
 	LOCAL_STORAGE_PIN_DATA_DISCOVERY_NDV_FLAG,
 	MAX_DISPLAY_DATA_SIZE,
 	MAX_DISPLAY_DATA_SIZE_SCHEMA_VIEW,
+	NDV_UI_OVERHAUL_EXPERIMENT,
 	NODE_TYPES_EXCLUDED_FROM_OUTPUT_NAME_APPEND,
-	SCHEMA_PREVIEW_EXPERIMENT,
+	RUN_DATA_DEFAULT_PAGE_SIZE,
 	TEST_PIN_DATA,
 } from '@/constants';
 
@@ -53,24 +53,25 @@ import JsonEditor from '@/components/JsonEditor/JsonEditor.vue';
 
 import RunDataPinButton from '@/components/RunDataPinButton.vue';
 import { useExternalHooks } from '@/composables/useExternalHooks';
-import { useI18n } from '@/composables/useI18n';
+import { useI18n } from '@n8n/i18n';
 import { useNodeHelpers } from '@/composables/useNodeHelpers';
 import { useNodeType } from '@/composables/useNodeType';
 import type { PinDataSource, UnpinDataSource } from '@/composables/usePinnedData';
 import { usePinnedData } from '@/composables/usePinnedData';
 import { useTelemetry } from '@/composables/useTelemetry';
 import { useToast } from '@/composables/useToast';
-import { dataPinningEventBus } from '@/event-bus';
+import { dataPinningEventBus, ndvEventBus } from '@/event-bus';
 import { useNDVStore } from '@/stores/ndv.store';
 import { useNodeTypesStore } from '@/stores/nodeTypes.store';
-import { useRootStore } from '@/stores/root.store';
+import { useRootStore } from '@n8n/stores/useRootStore';
 import { useSourceControlStore } from '@/stores/sourceControl.store';
 import { useWorkflowsStore } from '@/stores/workflows.store';
 import { executionDataToJson } from '@/utils/nodeTypesUtils';
 import { getGenericHints } from '@/utils/nodeViewUtils';
 import { searchInObject } from '@/utils/objectUtils';
 import { clearJsonKey, isEmpty, isPresent } from '@/utils/typesUtils';
-import { isEqual, isObject } from 'lodash-es';
+import isEqual from 'lodash/isEqual';
+import isObject from 'lodash/isObject';
 import {
 	N8nBlockUi,
 	N8nButton,
@@ -90,11 +91,13 @@ import { useRoute } from 'vue-router';
 import { useUIStore } from '@/stores/ui.store';
 import { useSchemaPreviewStore } from '@/stores/schemaPreview.store';
 import { asyncComputed } from '@vueuse/core';
-import { usePostHog } from '@/stores/posthog.store';
 import ViewSubExecution from './ViewSubExecution.vue';
 import RunDataItemCount from '@/components/RunDataItemCount.vue';
 import RunDataDisplayModeSelect from '@/components/RunDataDisplayModeSelect.vue';
 import RunDataPaginationBar from '@/components/RunDataPaginationBar.vue';
+import { parseAiContent } from '@/utils/aiUtils';
+import { usePostHog } from '@/stores/posthog.store';
+import { I18nT } from 'vue-i18n';
 
 const LazyRunDataTable = defineAsyncComponent(
 	async () => await import('@/components/RunDataTable.vue'),
@@ -109,6 +112,9 @@ const LazyRunDataSchema = defineAsyncComponent(
 const LazyRunDataHtml = defineAsyncComponent(
 	async () => await import('@/components/RunDataHtml.vue'),
 );
+const LazyRunDataAi = defineAsyncComponent(
+	async () => await import('@/components/RunDataParsedAiContent.vue'),
+);
 const LazyRunDataSearch = defineAsyncComponent(
 	async () => await import('@/components/RunDataSearch.vue'),
 );
@@ -119,12 +125,13 @@ export type EnterEditModeArgs = {
 
 type Props = {
 	workflow: Workflow;
-	workflowExecution?: IExecutionResponse;
+	workflowExecution?: IRunExecutionData;
 	runIndex: number;
 	tooMuchDataTitle: string;
 	executingMessage: string;
 	pushRef?: string;
 	paneType: NodePanelType;
+	displayMode: IRunDataDisplayMode;
 	noDataInBranchMessage: string;
 	node?: INodeUi | null;
 	nodes?: IConnectedNode[];
@@ -140,11 +147,14 @@ type Props = {
 	hidePagination?: boolean;
 	calloutMessage?: string;
 	disableRunIndexSelection?: boolean;
+	disableDisplayModeSelection?: boolean;
 	disableEdit?: boolean;
 	disablePin?: boolean;
 	compact?: boolean;
 	tableHeaderBgColor?: 'base' | 'light';
 	disableHoverHighlight?: boolean;
+	disableAiContent?: boolean;
+	collapsingTableColumnName: string | null;
 };
 
 const props = withDefaults(defineProps<Props>(), {
@@ -160,12 +170,14 @@ const props = withDefaults(defineProps<Props>(), {
 	hidePagination: false,
 	calloutMessage: undefined,
 	disableRunIndexSelection: false,
+	disableDisplayModeSelection: false,
 	disableEdit: false,
 	disablePin: false,
 	disableHoverHighlight: false,
 	compact: false,
 	tableHeaderBgColor: 'base',
 	workflowExecution: undefined,
+	disableAiContent: false,
 });
 
 defineSlots<{
@@ -198,6 +210,8 @@ const emit = defineEmits<{
 			avgRowHeight: number;
 		},
 	];
+	displayModeChange: [IRunDataDisplayMode];
+	collapsingTableColumnChanged: [columnName: string | null];
 }>();
 
 const connectionType = ref<NodeConnectionType>(NodeConnectionTypes.Main);
@@ -236,22 +250,18 @@ const node = toRef(props, 'node');
 
 const pinnedData = usePinnedData(node, {
 	runIndex: props.runIndex,
-	displayMode:
-		props.paneType === 'input' ? ndvStore.inputPanelDisplayMode : ndvStore.outputPanelDisplayMode,
+	displayMode: props.displayMode,
 });
 const { isSubNodeType } = useNodeType({
 	node,
 });
 
-const displayMode = computed(() =>
-	props.paneType === 'input' ? ndvStore.inputPanelDisplayMode : ndvStore.outputPanelDisplayMode,
-);
-
+const isArchivedWorkflow = computed(() => workflowsStore.workflow.isArchived);
 const isReadOnlyRoute = computed(() => route.meta.readOnlyCanvas === true);
 const isWaitNodeWaiting = computed(() => {
 	return (
 		node.value?.name &&
-		workflowExecution.value?.data?.resultData?.runData?.[node.value?.name]?.[props.runIndex]
+		workflowExecution.value?.resultData?.runData?.[node.value?.name]?.[props.runIndex]
 			?.executionStatus === 'waiting'
 	);
 });
@@ -263,7 +273,7 @@ const nodeType = computed(() => {
 	return nodeTypesStore.getNodeType(node.value.type, node.value.typeVersion);
 });
 
-const isSchemaView = computed(() => displayMode.value === 'schema');
+const isSchemaView = computed(() => props.displayMode === 'schema');
 const isSearchInSchemaView = computed(() => isSchemaView.value && !!search.value);
 const hasMultipleInputNodes = computed(() => props.paneType === 'input' && props.nodes.length > 0);
 const displaysMultipleNodes = computed(() => isSchemaView.value && hasMultipleInputNodes.value);
@@ -304,9 +314,7 @@ const subworkflowExecutionError = computed(() => {
 	} as NodeError;
 });
 
-const hasSubworkflowExecutionError = computed(() =>
-	Boolean(workflowsStore.subWorkflowExecutionError),
-);
+const hasSubworkflowExecutionError = computed(() => !!workflowsStore.subWorkflowExecutionError);
 
 // Sub-nodes may wish to display the parent node error as it can contain additional metadata
 const parentNodeError = computed(() => {
@@ -338,13 +346,13 @@ const executionHints = computed(() => {
 });
 
 const workflowExecution = computed(
-	() => props.workflowExecution ?? workflowsStore.getWorkflowExecution ?? undefined,
+	() => props.workflowExecution ?? workflowsStore.getWorkflowExecution?.data ?? undefined,
 );
 const workflowRunData = computed(() => {
 	if (workflowExecution.value === undefined) {
 		return null;
 	}
-	const executionData: IRunExecutionData | undefined = workflowExecution.value?.data;
+	const executionData: IRunExecutionData | undefined = workflowExecution.value;
 	if (executionData?.resultData) {
 		return executionData.resultData.runData;
 	}
@@ -365,7 +373,7 @@ const maxOutputIndex = computed(() => {
 
 	const runData: IRunData | null = workflowRunData.value;
 
-	if (runData === null || !runData.hasOwnProperty(node.value.name)) {
+	if (!runData?.hasOwnProperty(node.value.name)) {
 		return 0;
 	}
 
@@ -390,7 +398,7 @@ const maxRunIndex = computed(() => {
 
 	const runData: IRunData | null = workflowRunData.value;
 
-	if (runData === null || !runData.hasOwnProperty(node.value.name)) {
+	if (!runData?.hasOwnProperty(node.value.name)) {
 		return 0;
 	}
 
@@ -546,7 +554,8 @@ const pinButtonDisabled = computed(
 		(!rawInputData.value.length && !pinnedData.hasData.value) ||
 		!!binaryData.value?.length ||
 		isReadOnlyRoute.value ||
-		readOnlyEnv.value,
+		readOnlyEnv.value ||
+		isArchivedWorkflow.value,
 );
 
 const activeTaskMetadata = computed((): ITaskMetadata | null => {
@@ -580,13 +589,14 @@ const hasInputOverwrite = computed((): boolean => {
 const isSchemaPreviewEnabled = computed(
 	() =>
 		props.paneType === 'input' &&
-		!(nodeType.value?.codex?.categories ?? []).some(
-			(category) => category === CORE_NODES_CATEGORY,
-		) &&
-		posthogStore.isVariantEnabled(
-			SCHEMA_PREVIEW_EXPERIMENT.name,
-			SCHEMA_PREVIEW_EXPERIMENT.variant,
-		),
+		!(nodeType.value?.codex?.categories ?? []).some((category) => category === CORE_NODES_CATEGORY),
+);
+
+const isNDVV2 = computed(() =>
+	posthogStore.isVariantEnabled(
+		NDV_UI_OVERHAUL_EXPERIMENT.name,
+		NDV_UI_OVERHAUL_EXPERIMENT.variant,
+	),
 );
 
 const hasPreviewSchema = asyncComputed(async () => {
@@ -616,6 +626,20 @@ const itemsCountProps = computed<InstanceType<typeof RunDataItemCount>['$props']
 	unfilteredDataCount: unfilteredDataCount.value,
 	subExecutionsCount: activeTaskMetadata.value?.subExecutionsCount,
 }));
+
+const parsedAiContent = computed(() =>
+	props.disableAiContent ? [] : parseAiContent(rawInputData.value, connectionType.value),
+);
+
+const hasParsedAiContent = computed(() =>
+	parsedAiContent.value.some((prr) => prr.parsedContent?.parsed),
+);
+
+function setInputBranchIndex(value: number) {
+	if (props.paneType === 'input') {
+		outputIndex.value = value;
+	}
+}
 
 watch(node, (newNode, prevNode) => {
 	if (newNode?.id === prevNode?.id) return;
@@ -653,9 +677,9 @@ watch(jsonData, (data: IDataObject[], prevData: IDataObject[]) => {
 });
 
 watch(binaryData, (newData, prevData) => {
-	if (newData.length && !prevData.length && displayMode.value !== 'binary') {
+	if (newData.length && !prevData.length && props.displayMode !== 'binary') {
 		switchToBinary();
-	} else if (!newData.length && displayMode.value === 'binary') {
+	} else if (!newData.length && props.displayMode === 'binary') {
 		onDisplayModeChange('table');
 	}
 });
@@ -671,8 +695,21 @@ watch(search, (newSearch) => {
 	emit('search', newSearch);
 });
 
+// Switch to AI display mode if it's most suitable
+watch(
+	hasParsedAiContent,
+	(hasAiContent) => {
+		if (hasAiContent && props.displayMode !== 'ai') {
+			emit('displayModeChange', 'ai');
+		}
+	},
+	{ immediate: true },
+);
+
 onMounted(() => {
 	init();
+
+	ndvEventBus.on('setInputBranchIndex', setInputBranchIndex);
 
 	if (!isPaneTypeInput.value) {
 		showPinDataDiscoveryTooltip(jsonData.value);
@@ -692,24 +729,19 @@ onMounted(() => {
 		const errorsToTrack = ['unknown error'];
 
 		if (error && errorsToTrack.some((e) => error.message?.toLowerCase().includes(e))) {
-			telemetry.track(
-				'User encountered an error',
-				{
-					node: node.value.type,
-					errorMessage: error.message,
-					nodeVersion: node.value.typeVersion,
-					n8nVersion: rootStore.versionCli,
-				},
-				{
-					withPostHog: true,
-				},
-			);
+			telemetry.track('User encountered an error', {
+				node: node.value.type,
+				errorMessage: error.message,
+				nodeVersion: node.value.typeVersion,
+				n8nVersion: rootStore.versionCli,
+			});
 		}
 	}
 });
 
 onBeforeUnmount(() => {
 	hidePinDataDiscoveryTooltip();
+	ndvEventBus.off('setInputBranchIndex', setInputBranchIndex);
 });
 
 function getResolvedNodeOutputs() {
@@ -756,7 +788,7 @@ function getNodeHints(): NodeHint[] {
 
 			if (workflowNode) {
 				const nodeHints = nodeHelpers.getNodeHints(props.workflow, workflowNode, nodeType.value, {
-					runExecutionData: workflowExecution.value?.data ?? null,
+					runExecutionData: workflowExecution.value ?? null,
 					runIndex: props.runIndex,
 					connectionInputData: parentNodeOutputData.value,
 				});
@@ -816,7 +848,13 @@ function showPinDataDiscoveryTooltip(value: IDataObject[]) {
 
 	const pinDataDiscoveryFlag = useStorage(LOCAL_STORAGE_PIN_DATA_DISCOVERY_NDV_FLAG).value;
 
-	if (value && value.length > 0 && !isReadOnlyRoute.value && !pinDataDiscoveryFlag) {
+	if (
+		value &&
+		value.length > 0 &&
+		!isReadOnlyRoute.value &&
+		!isArchivedWorkflow.value &&
+		!pinDataDiscoveryFlag
+	) {
 		pinDataDiscoveryComplete();
 
 		setTimeout(() => {
@@ -860,7 +898,7 @@ function enterEditMode({ origin }: EnterEditModeArgs) {
 		push_ref: props.pushRef,
 		run_index: props.runIndex,
 		is_output_present: hasNodeRun.value || pinnedData.hasData.value,
-		view: !hasNodeRun.value && !pinnedData.hasData.value ? 'undefined' : displayMode.value,
+		view: !hasNodeRun.value && !pinnedData.hasData.value ? 'undefined' : props.displayMode,
 		is_data_pinned: pinnedData.hasData.value,
 	});
 }
@@ -903,7 +941,7 @@ function onExitEditMode({ type }: { type: 'save' | 'cancel' }) {
 		node_type: activeNode.value?.type,
 		push_ref: props.pushRef,
 		run_index: props.runIndex,
-		view: displayMode.value,
+		view: props.displayMode,
 		type,
 	});
 }
@@ -918,7 +956,7 @@ async function onTogglePinData({ source }: { source: PinDataSource | UnpinDataSo
 			node_type: activeNode.value?.type,
 			push_ref: props.pushRef,
 			run_index: props.runIndex,
-			view: !hasNodeRun.value && !pinnedData.hasData.value ? 'none' : displayMode.value,
+			view: !hasNodeRun.value && !pinnedData.hasData.value ? 'none' : props.displayMode,
 		};
 
 		void externalHooks.run('runData.onTogglePinData', telemetryPayload);
@@ -1037,8 +1075,8 @@ function onPageSizeChange(newPageSize: number) {
 }
 
 function onDisplayModeChange(newDisplayMode: IRunDataDisplayMode) {
-	const previous = displayMode.value;
-	ndvStore.setPanelDisplayMode({ pane: props.paneType, mode: newDisplayMode });
+	const previous = props.displayMode;
+	emit('displayModeChange', newDisplayMode);
 
 	if (!userEnabledShowData.value) updateShowData();
 
@@ -1177,6 +1215,7 @@ function init() {
 	outputIndex.value = determineInitialOutputIndex();
 	refreshDataSize();
 	closeBinaryDataDisplay();
+
 	let outputTypes: NodeConnectionType[] = [];
 	if (node.value && nodeType.value) {
 		const outputs = getResolvedNodeOutputs();
@@ -1184,15 +1223,13 @@ function init() {
 	}
 	connectionType.value = outputTypes.length === 0 ? NodeConnectionTypes.Main : outputTypes[0];
 	if (binaryData.value.length > 0) {
-		ndvStore.setPanelDisplayMode({
-			pane: props.paneType,
-			mode: 'binary',
-		});
-	} else if (displayMode.value === 'binary') {
-		ndvStore.setPanelDisplayMode({
-			pane: props.paneType,
-			mode: 'schema',
-		});
+		emit('displayModeChange', 'binary');
+	} else if (props.displayMode === 'binary') {
+		emit('displayModeChange', 'schema');
+	}
+
+	if (isNDVV2.value) {
+		pageSize.value = RUN_DATA_DEFAULT_PAGE_SIZE;
 	}
 }
 
@@ -1308,10 +1345,7 @@ function setDisplayMode() {
 		activeNode.value.parameters.operation === 'generateHtmlTemplate';
 
 	if (shouldDisplayHtml) {
-		ndvStore.setPanelDisplayMode({
-			pane: 'output',
-			mode: 'html',
-		});
+		emit('displayModeChange', 'html');
 	}
 }
 
@@ -1329,7 +1363,11 @@ defineExpose({ enterEditMode });
 
 <template>
 	<div
-		:class="['run-data', $style.container, props.compact ? $style.compact : '']"
+		:class="[
+			'run-data',
+			$style.container,
+			{ [$style['ndv-v2']]: isNDVV2, [$style.compact]: compact },
+		]"
 		@mouseover="activatePane"
 	>
 		<N8nCallout
@@ -1340,12 +1378,12 @@ defineExpose({ enterEditMode });
 				!isProductionExecutionPreview
 			"
 			theme="secondary"
-			icon="thumbtack"
+			icon="pin"
 			:class="$style.pinnedDataCallout"
 			data-test-id="ndv-pinned-data-callout"
 		>
 			{{ i18n.baseText('runData.pindata.thisDataIsPinned') }}
-			<span v-if="!isReadOnlyRoute && !readOnlyEnv" class="ml-4xs">
+			<span v-if="!isReadOnlyRoute && !isArchivedWorkflow && !readOnlyEnv" class="ml-4xs">
 				<N8nLink
 					theme="secondary"
 					size="small"
@@ -1401,14 +1439,24 @@ defineExpose({ enterEditMode });
 					/>
 				</Suspense>
 
+				<N8nIconButton
+					v-if="displayMode === 'table' && collapsingTableColumnName !== null"
+					:class="$style.resetCollapseButton"
+					text
+					icon="chevrons-up-down"
+					size="xmini"
+					type="tertiary"
+					@click="emit('collapsingTableColumnChanged', null)"
+				/>
+
 				<RunDataDisplayModeSelect
+					v-if="!disableDisplayModeSelection"
 					v-show="
 						hasPreviewSchema ||
 						(hasNodeRun &&
 							(inputData.length || binaryData.length || search || hasMultipleInputNodes) &&
 							!editMode.enabled)
 					"
-					:class="$style.displayModeSelect"
 					:compact="props.compact"
 					:value="displayMode"
 					:has-binary-data="binaryData.length > 0"
@@ -1417,10 +1465,9 @@ defineExpose({ enterEditMode });
 						activeNode?.type === HTML_NODE_TYPE &&
 						activeNode.parameters.operation === 'generateHtmlTemplate'
 					"
+					:has-renderable-data="hasParsedAiContent"
 					@change="onDisplayModeChange"
 				/>
-
-				<RunDataItemCount v-if="props.compact" v-bind="itemsCountProps" />
 
 				<N8nIconButton
 					v-if="!props.disableEdit && canPinData && !isReadOnlyRoute && !readOnlyEnv"
@@ -1428,7 +1475,7 @@ defineExpose({ enterEditMode });
 					:title="i18n.baseText('runData.editOutput')"
 					:circle="false"
 					:disabled="node?.disabled"
-					icon="pencil-alt"
+					icon="pencil"
 					type="tertiary"
 					data-test-id="ndv-edit-pinned-data"
 					@click="enterEditMode({ origin: 'editIconButton' })"
@@ -1461,6 +1508,8 @@ defineExpose({ enterEditMode });
 					/>
 				</div>
 			</div>
+
+			<RunDataItemCount v-if="props.compact" v-bind="itemsCountProps" />
 		</div>
 
 		<div v-if="inputSelectLocation === 'header'" :class="$style.inputSelect">
@@ -1551,6 +1600,7 @@ defineExpose({ enterEditMode });
 
 			<div :class="$style.tabs">
 				<N8nTabs
+					size="small"
 					:model-value="currentOutputIndex"
 					:options="branches"
 					@update:model-value="onBranchChange"
@@ -1584,10 +1634,12 @@ defineExpose({ enterEditMode });
 		<div ref="dataContainerRef" :class="$style.dataContainer" data-test-id="ndv-data-container">
 			<div
 				v-if="isExecuting && !isWaitNodeWaiting"
-				:class="$style.center"
+				:class="[$style.center, $style.executingMessage]"
 				data-test-id="ndv-executing"
 			>
-				<div :class="$style.spinner"><N8nSpinner type="ring" /></div>
+				<div v-if="!props.compact" :class="$style.spinner">
+					<N8nSpinner type="ring" />
+				</div>
 				<N8nText>{{ executingMessage }}</N8nText>
 			</div>
 
@@ -1615,7 +1667,12 @@ defineExpose({ enterEditMode });
 				"
 				:class="$style.stretchVertically"
 			>
-				<NodeErrorView :error="subworkflowExecutionError" :class="$style.errorDisplay" />
+				<NodeErrorView
+					:compact="compact"
+					:error="subworkflowExecutionError"
+					:class="$style.errorDisplay"
+					show-details
+				/>
 			</div>
 
 			<div v-else-if="isWaitNodeWaiting" :class="$style.center">
@@ -1677,7 +1734,7 @@ defineExpose({ enterEditMode });
 						v-if="workflowRunErrorAsNodeError"
 						:error="workflowRunErrorAsNodeError"
 						:class="$style.inlineError"
-						compact
+						:compact="compact"
 					/>
 					<slot name="content"></slot>
 				</div>
@@ -1685,6 +1742,8 @@ defineExpose({ enterEditMode });
 					v-else-if="workflowRunErrorAsNodeError"
 					:error="workflowRunErrorAsNodeError"
 					:class="$style.dataDisplay"
+					:compact="compact"
+					show-details
 				/>
 			</div>
 
@@ -1700,13 +1759,13 @@ defineExpose({ enterEditMode });
 				<div v-if="search">
 					<N8nText tag="h3" size="large">{{ i18n.baseText('ndv.search.noMatch.title') }}</N8nText>
 					<N8nText>
-						<i18n-t keypath="ndv.search.noMatch.description" tag="span">
+						<I18nT keypath="ndv.search.noMatch.description" tag="span" scope="global">
 							<template #link>
 								<a href="#" @click="onSearchClear">
 									{{ i18n.baseText('ndv.search.noMatch.description.link') }}
 								</a>
 							</template>
-						</i18n-t>
+						</I18nT>
 					</N8nText>
 				</div>
 				<N8nText v-else>
@@ -1718,7 +1777,7 @@ defineExpose({ enterEditMode });
 				v-else-if="hasNodeRun && !inputData.length && !displaysMultipleNodes && !search"
 				:class="$style.center"
 			>
-				<slot name="no-output-data">xxx</slot>
+				<slot name="no-output-data"></slot>
 			</div>
 
 			<div
@@ -1774,13 +1833,13 @@ defineExpose({ enterEditMode });
 			<div v-else-if="showIoSearchNoMatchContent" :class="$style.center">
 				<N8nText tag="h3" size="large">{{ i18n.baseText('ndv.search.noMatch.title') }}</N8nText>
 				<N8nText>
-					<i18n-t keypath="ndv.search.noMatch.description" tag="span">
+					<I18nT keypath="ndv.search.noMatch.description" tag="span" scope="global">
 						<template #link>
 							<a href="#" @click="onSearchClear">
 								{{ i18n.baseText('ndv.search.noMatch.description.link') }}
 							</a>
 						</template>
-					</i18n-t>
+					</I18nT>
 				</N8nText>
 			</div>
 
@@ -1798,9 +1857,11 @@ defineExpose({ enterEditMode });
 					:header-bg-color="tableHeaderBgColor"
 					:compact="props.compact"
 					:disable-hover-highlight="props.disableHoverHighlight"
+					:collapsing-column-name="collapsingTableColumnName"
 					@mounted="emit('tableMounted', $event)"
 					@active-row-changed="onItemHover"
 					@display-mode-change="onDisplayModeChange"
+					@collapsing-column-changed="emit('collapsingTableColumnChanged', $event)"
 				/>
 			</Suspense>
 
@@ -1823,6 +1884,15 @@ defineExpose({ enterEditMode });
 
 			<Suspense v-else-if="hasNodeRun && isPaneTypeOutput && displayMode === 'html'">
 				<LazyRunDataHtml :input-html="inputHtml" />
+			</Suspense>
+
+			<Suspense v-else-if="hasNodeRun && displayMode === 'ai'">
+				<LazyRunDataAi
+					render-type="rendered"
+					:compact="compact"
+					:content="parsedAiContent"
+					:search="search"
+				/>
 			</Suspense>
 
 			<Suspense v-else-if="(hasNodeRun || hasPreviewSchema) && isSchemaView">
@@ -1962,7 +2032,7 @@ defineExpose({ enterEditMode });
 	flex-direction: column;
 	align-items: center;
 	justify-content: center;
-	padding: var(--spacing-s) var(--spacing-s) var(--spacing-xl) var(--spacing-s);
+	padding: var(--ndv-spacing) var(--ndv-spacing) var(--spacing-xl) var(--ndv-spacing);
 	text-align: center;
 
 	> * {
@@ -1972,6 +2042,7 @@ defineExpose({ enterEditMode });
 }
 
 .container {
+	--ndv-spacing: var(--spacing-s);
 	position: relative;
 	width: 100%;
 	height: 100%;
@@ -1990,12 +2061,12 @@ defineExpose({ enterEditMode });
 .header {
 	display: flex;
 	align-items: center;
-	margin-bottom: var(--spacing-s);
-	padding: var(--spacing-s) var(--spacing-s) 0 var(--spacing-s);
+	margin-bottom: var(--ndv-spacing);
+	padding: var(--ndv-spacing) var(--ndv-spacing) 0 var(--ndv-spacing);
 	position: relative;
 	overflow-x: auto;
 	overflow-y: hidden;
-	min-height: calc(30px + var(--spacing-s));
+	min-height: calc(30px + var(--ndv-spacing));
 	scrollbar-width: thin;
 	container-type: inline-size;
 
@@ -2006,6 +2077,7 @@ defineExpose({ enterEditMode });
 		flex-shrink: 0;
 		flex-grow: 0;
 		min-height: auto;
+		gap: var(--spacing-2xs);
 	}
 
 	> *:first-child {
@@ -2023,7 +2095,7 @@ defineExpose({ enterEditMode });
 	position: absolute;
 	top: 0;
 	left: 0;
-	padding: 0 var(--spacing-s) var(--spacing-3xl) var(--spacing-s);
+	padding: 0 var(--ndv-spacing) var(--spacing-3xl) var(--ndv-spacing);
 	right: 0;
 	overflow-y: auto;
 	line-height: var(--font-line-height-xloose);
@@ -2037,18 +2109,25 @@ defineExpose({ enterEditMode });
 
 .inlineError {
 	line-height: var(--font-line-height-xloose);
-	padding-left: var(--spacing-s);
-	padding-right: var(--spacing-s);
-	padding-bottom: var(--spacing-s);
+	padding-left: var(--ndv-spacing);
+	padding-right: var(--ndv-spacing);
+	padding-bottom: var(--ndv-spacing);
 }
 
 .outputs {
 	display: flex;
 	flex-direction: column;
-	gap: var(--spacing-s);
-	padding-left: var(--spacing-s);
-	padding-right: var(--spacing-s);
-	padding-bottom: var(--spacing-s);
+	gap: var(--ndv-spacing);
+	padding-left: var(--ndv-spacing);
+	padding-right: var(--ndv-spacing);
+	padding-bottom: var(--ndv-spacing);
+
+	.compact & {
+		padding-left: var(--spacing-2xs);
+		padding-right: var(--spacing-2xs);
+		padding-bottom: var(--spacing-2xs);
+		font-size: var(--font-size-2xs);
+	}
 }
 
 .tabs {
@@ -2063,25 +2142,29 @@ defineExpose({ enterEditMode });
 	display: flex;
 	align-items: center;
 	gap: var(--spacing-2xs);
-	padding-left: var(--spacing-s);
-	padding-right: var(--spacing-s);
-	padding-bottom: var(--spacing-s);
+	padding-left: var(--ndv-spacing);
+	padding-right: var(--ndv-spacing);
+	padding-bottom: var(--ndv-spacing);
 	flex-flow: wrap;
 }
 
+.ndv-v2 .itemsCount {
+	padding-left: var(--spacing-xs);
+}
+
 .inputSelect {
-	padding-left: var(--spacing-s);
-	padding-right: var(--spacing-s);
-	padding-bottom: var(--spacing-s);
+	padding-left: var(--ndv-spacing);
+	padding-right: var(--ndv-spacing);
+	padding-bottom: var(--ndv-spacing);
 }
 
 .runSelector {
 	display: flex;
 	align-items: center;
 	flex-flow: wrap;
-	padding-left: var(--spacing-s);
-	padding-right: var(--spacing-s);
-	margin-bottom: var(--spacing-s);
+	padding-left: var(--ndv-spacing);
+	padding-right: var(--ndv-spacing);
+	margin-bottom: var(--ndv-spacing);
 	gap: var(--spacing-3xs);
 
 	:global(.el-input--suffix .el-input__inner) {
@@ -2131,11 +2214,11 @@ defineExpose({ enterEditMode });
 	width: 300px;
 	overflow: hidden;
 	background-color: var(--color-foreground-xlight);
-	margin-right: var(--spacing-s);
-	margin-bottom: var(--spacing-s);
+	margin-right: var(--ndv-spacing);
+	margin-bottom: var(--ndv-spacing);
 	border-radius: var(--border-radius-base);
 	border: var(--border-base);
-	padding: var(--spacing-s);
+	padding: var(--ndv-spacing);
 }
 
 .binaryHeader {
@@ -2174,6 +2257,15 @@ defineExpose({ enterEditMode });
 	.compact & {
 		/* let title text alone decide the height */
 		height: 0;
+		visibility: hidden;
+
+		:global(.el-input__prefix) {
+			transition-duration: 0ms;
+		}
+	}
+
+	.compact:hover & {
+		visibility: visible;
 	}
 }
 
@@ -2190,7 +2282,7 @@ defineExpose({ enterEditMode });
 
 	display: flex;
 	justify-content: center;
-	margin-bottom: var(--spacing-s);
+	margin-bottom: var(--ndv-spacing);
 }
 
 .editMode {
@@ -2198,8 +2290,8 @@ defineExpose({ enterEditMode });
 	display: flex;
 	flex-direction: column;
 	justify-content: stretch;
-	padding-left: var(--spacing-s);
-	padding-right: var(--spacing-s);
+	padding-left: var(--ndv-spacing);
+	padding-right: var(--ndv-spacing);
 }
 
 .editModeBody {
@@ -2215,8 +2307,8 @@ defineExpose({ enterEditMode });
 	width: 100%;
 	justify-content: space-between;
 	align-items: center;
-	padding-top: var(--spacing-s);
-	padding-bottom: var(--spacing-s);
+	padding-top: var(--ndv-spacing);
+	padding-bottom: var(--ndv-spacing);
 }
 
 .editModeFooterInfotip {
@@ -2229,7 +2321,7 @@ defineExpose({ enterEditMode });
 	display: flex;
 	justify-content: flex-end;
 	align-items: center;
-	margin-left: var(--spacing-s);
+	margin-left: var(--ndv-spacing);
 }
 
 .stretchVertically {
@@ -2243,8 +2335,8 @@ defineExpose({ enterEditMode });
 
 .hintCallout {
 	margin-bottom: var(--spacing-xs);
-	margin-left: var(--spacing-s);
-	margin-right: var(--spacing-s);
+	margin-left: var(--ndv-spacing);
+	margin-right: var(--ndv-spacing);
 
 	.compact & {
 		margin: 0 var(--spacing-2xs) var(--spacing-2xs) var(--spacing-2xs);
@@ -2252,19 +2344,17 @@ defineExpose({ enterEditMode });
 }
 
 .schema {
-	padding: 0 var(--spacing-s);
+	padding: 0 var(--ndv-spacing);
 }
 
-.search,
-.displayModeSelect {
-	.compact:not(:hover) & {
-		opacity: 0;
-		display: none;
+.executingMessage {
+	.compact & {
+		color: var(--color-text-light);
 	}
+}
 
-	.compact:hover & {
-		opacity: 1;
-	}
+.resetCollapseButton {
+	color: var(--color-foreground-xdark);
 }
 
 @container (max-width: 240px) {
@@ -2273,6 +2363,11 @@ defineExpose({ enterEditMode });
 		visibility: hidden;
 		width: 0;
 	}
+}
+
+.ndv-v2,
+.compact {
+	--ndv-spacing: var(--spacing-2xs);
 }
 </style>
 

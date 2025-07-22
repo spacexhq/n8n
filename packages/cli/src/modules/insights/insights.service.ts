@@ -1,31 +1,17 @@
-import {
-	type InsightsSummary,
-	type InsightsDateRange,
-	INSIGHTS_DATE_RANGE_KEYS,
-} from '@n8n/api-types';
-import { OnShutdown } from '@n8n/decorators';
+import { type InsightsSummary, type InsightsDateRange } from '@n8n/api-types';
+import { LicenseState, Logger } from '@n8n/backend-common';
+import { OnLeaderStepdown, OnLeaderTakeover } from '@n8n/decorators';
 import { Service } from '@n8n/di';
-import { Logger } from 'n8n-core';
-import type { ExecutionLifecycleHooks } from 'n8n-core';
-import { UserError, type IRun } from 'n8n-workflow';
-
-import { License } from '@/license';
+import { InstanceSettings } from 'n8n-core';
+import { UserError } from 'n8n-workflow';
 
 import type { PeriodUnit, TypeUnit } from './database/entities/insights-shared';
-import { NumberToType } from './database/entities/insights-shared';
+import { NumberToType, TypeToNumber } from './database/entities/insights-shared';
 import { InsightsByPeriodRepository } from './database/repositories/insights-by-period.repository';
 import { InsightsCollectionService } from './insights-collection.service';
 import { InsightsCompactionService } from './insights-compaction.service';
-
-const keyRangeToDays: Record<InsightsDateRange['key'], number> = {
-	day: 1,
-	week: 7,
-	'2weeks': 14,
-	month: 30,
-	quarter: 90,
-	'6months': 180,
-	year: 365,
-};
+import { InsightsPruningService } from './insights-pruning.service';
+import { INSIGHTS_DATE_RANGE_KEYS, keyRangeToDays } from './insights.constants';
 
 @Service()
 export class InsightsService {
@@ -33,30 +19,45 @@ export class InsightsService {
 		private readonly insightsByPeriodRepository: InsightsByPeriodRepository,
 		private readonly compactionService: InsightsCompactionService,
 		private readonly collectionService: InsightsCollectionService,
-		private readonly license: License,
+		private readonly pruningService: InsightsPruningService,
+		private readonly licenseState: LicenseState,
+		private readonly instanceSettings: InstanceSettings,
 		private readonly logger: Logger,
-	) {}
+	) {
+		this.logger = this.logger.scoped('insights');
+	}
 
-	startBackgroundProcess() {
-		this.compactionService.startCompactionTimer();
+	settings() {
+		return {
+			summary: this.licenseState.isInsightsSummaryLicensed(),
+			dashboard: this.licenseState.isInsightsDashboardLicensed(),
+			dateRanges: this.getAvailableDateRanges(),
+		};
+	}
+
+	startTimers() {
 		this.collectionService.startFlushingTimer();
-		this.logger.debug('Started compaction and flushing schedulers');
+
+		if (this.instanceSettings.isLeader) this.startCompactionAndPruningTimers();
 	}
 
-	stopBackgroundProcess() {
+	@OnLeaderTakeover()
+	startCompactionAndPruningTimers() {
+		this.compactionService.startCompactionTimer();
+		if (this.pruningService.isPruningEnabled) {
+			this.pruningService.startPruningTimer();
+		}
+	}
+
+	@OnLeaderStepdown()
+	stopCompactionAndPruningTimers() {
 		this.compactionService.stopCompactionTimer();
-		this.collectionService.stopFlushingTimer();
-		this.logger.debug('Stopped compaction and flushing schedulers');
+		this.pruningService.stopPruningTimer();
 	}
 
-	@OnShutdown()
 	async shutdown() {
 		await this.collectionService.shutdown();
-		this.compactionService.stopCompactionTimer();
-	}
-
-	async workflowExecuteAfterHandler(ctx: ExecutionLifecycleHooks, fullRunData: IRun) {
-		await this.collectionService.workflowExecuteAfterHandler(ctx, fullRunData);
+		this.stopCompactionAndPruningTimers();
 	}
 
 	async getInsightsSummary({
@@ -172,53 +173,45 @@ export class InsightsService {
 	async getInsightsByTime({
 		maxAgeInDays,
 		periodUnit,
-	}: { maxAgeInDays: number; periodUnit: PeriodUnit }) {
+		// Default to all insight types
+		insightTypes = Object.keys(TypeToNumber) as TypeUnit[],
+	}: { maxAgeInDays: number; periodUnit: PeriodUnit; insightTypes?: TypeUnit[] }) {
 		const rows = await this.insightsByPeriodRepository.getInsightsByTime({
 			maxAgeInDays,
 			periodUnit,
+			insightTypes,
 		});
 
 		return rows.map((r) => {
-			const total = r.succeeded + r.failed;
+			const { periodStart, runTime, ...rest } = r;
+			const values: typeof rest & {
+				total?: number;
+				successRate?: number;
+				failureRate?: number;
+				averageRunTime?: number;
+			} = rest;
+
+			// Compute ratio if total has been computed
+			if (typeof r.succeeded === 'number' && typeof r.failed === 'number') {
+				const total = r.succeeded + r.failed;
+				values.total = total;
+				values.failureRate = total ? r.failed / total : 0;
+				if (typeof runTime === 'number') {
+					values.averageRunTime = total ? runTime / total : 0;
+				}
+			}
 			return {
 				date: r.periodStart,
-				values: {
-					total,
-					succeeded: r.succeeded,
-					failed: r.failed,
-					failureRate: r.failed / total,
-					averageRunTime: r.runTime / total,
-					timeSaved: r.timeSaved,
-				},
+				values,
 			};
 		});
-	}
-
-	/**
-	 * Returns the available date ranges with their license authorization and time granularity
-	 * when grouped by time.
-	 */
-	getAvailableDateRanges(): InsightsDateRange[] {
-		const maxHistoryInDays =
-			this.license.getInsightsMaxHistory() === -1
-				? Number.MAX_SAFE_INTEGER
-				: this.license.getInsightsMaxHistory();
-		const isHourlyDateEnabled = this.license.isInsightsHourlyDataEnabled();
-
-		return INSIGHTS_DATE_RANGE_KEYS.map((key) => ({
-			key,
-			licensed:
-				key === 'day' ? (isHourlyDateEnabled ?? false) : maxHistoryInDays >= keyRangeToDays[key],
-			granularity: key === 'day' ? 'hour' : keyRangeToDays[key] <= 30 ? 'day' : 'week',
-		}));
 	}
 
 	getMaxAgeInDaysAndGranularity(
 		dateRangeKey: InsightsDateRange['key'],
 	): InsightsDateRange & { maxAgeInDays: number } {
-		const availableDateRanges = this.getAvailableDateRanges();
+		const dateRange = this.getAvailableDateRanges().find((range) => range.key === dateRangeKey);
 
-		const dateRange = availableDateRanges.find((range) => range.key === dateRangeKey);
 		if (!dateRange) {
 			// Not supposed to happen if we trust the dateRangeKey type
 			throw new UserError('The selected date range is not available');
@@ -232,4 +225,29 @@ export class InsightsService {
 
 		return { ...dateRange, maxAgeInDays: keyRangeToDays[dateRangeKey] };
 	}
+
+	/**
+	 * Returns the available date ranges with their license authorization and time granularity
+	 * when grouped by time.
+	 */
+	getAvailableDateRanges(): DateRange[] {
+		const maxHistoryInDays =
+			this.licenseState.getInsightsMaxHistory() === -1
+				? Number.MAX_SAFE_INTEGER
+				: this.licenseState.getInsightsMaxHistory();
+		const isHourlyDateLicensed = this.licenseState.isInsightsHourlyDataLicensed();
+
+		return INSIGHTS_DATE_RANGE_KEYS.map((key) => ({
+			key,
+			licensed:
+				key === 'day' ? (isHourlyDateLicensed ?? false) : maxHistoryInDays >= keyRangeToDays[key],
+			granularity: key === 'day' ? 'hour' : keyRangeToDays[key] <= 30 ? 'day' : 'week',
+		}));
+	}
 }
+
+type DateRange = {
+	key: 'day' | 'week' | '2weeks' | 'month' | 'quarter' | '6months' | 'year';
+	licensed: boolean;
+	granularity: 'hour' | 'day' | 'week';
+};

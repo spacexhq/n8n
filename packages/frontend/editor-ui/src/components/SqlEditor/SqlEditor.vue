@@ -112,36 +112,27 @@ const extensions = computed(() => {
 	}
 	return baseExtensions;
 });
-const editorValue = ref(props.modelValue);
 const {
 	editor,
 	segments: { all: segments },
 	readEditorValue,
 	hasFocus: editorHasFocus,
-	isDirty,
+	focus,
 } = useExpressionEditor({
 	editorRef: sqlEditor,
-	editorValue,
+	editorValue: () => props.modelValue,
 	extensions,
 	skipSegments: ['Statement', 'CompositeIdentifier', 'Parens', 'Brackets'],
 	isReadOnly: props.isReadOnly,
+	onChange: () => {
+		emit('update:model-value', readEditorValue());
+	},
 });
 
-watch(
-	() => props.modelValue,
-	(newValue) => {
-		editorValue.value = newValue;
-	},
-);
-
-watch(editorHasFocus, (focus) => {
-	if (focus) {
+watch(editorHasFocus, (hasFocus) => {
+	if (hasFocus) {
 		isFocused.value = true;
 	}
-});
-
-watch(segments, () => {
-	emit('update:model-value', readEditorValue());
 });
 
 onMounted(() => {
@@ -153,7 +144,6 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
-	if (isDirty.value) emit('update:model-value', readEditorValue());
 	codeNodeEditorEventBus.off('highlightLine', highlightLine);
 });
 
@@ -202,6 +192,10 @@ async function onDrop(value: string, event: MouseEvent) {
 
 	await dropInExpressionEditor(toRaw(editor.value), event, value);
 }
+
+defineExpose({
+	focus,
+});
 </script>
 
 <template>
