@@ -1,0 +1,31 @@
+version: "3.8"
+
+services:
+  n8n:
+    build:
+      context: .
+    environment:
+      - N8N_EDITOR_BASE_URL=https://n8n.spacexhq.online
+      - WEBHOOK_URL=https://n8n.spacexhq.online
+      - N8N_HOST=n8n.spacexhq.online
+      - N8N_PORT=5678
+      - N8N_SECURE_COOKIE=true
+      - GENERIC_TIMEZONE=Africa/Lagos
+      - TZ=Africa/Lagos
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=admin
+      - N8N_BASIC_AUTH_PASSWORD=yourStrongPasswordHere
+    volumes:
+      - n8n-data:/home/node/.n8n
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -qO- http://127.0.0.1:5678/ || exit 1
+      interval: 5s
+      timeout: 20s
+      retries: 10
+
+volumes:
+  n8n-data:
+
